@@ -34,12 +34,19 @@ def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="c
     
     del pipe
     
-    # # [Cite: 12, 108] Use UniPC Scheduler with solver_order=2 for speed/quality balance
-    # scheduler = UniPCMultistepScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
-    # scheduler.config.solver_order = 2
-
-    # Use DDIM scheduler
-    scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
+    if scheduler_type == "unipc":
+        # Configure UniPC: solver_order=2 is optimal for guided sampling (CFG) [cite: 109]
+        # thresholding=False is recommended for latent models [cite: 111]
+        scheduler = UniPCMultistepScheduler.from_pretrained(
+            model_key, 
+            subfolder="scheduler", 
+            torch_dtype=precision_t,
+            solver_order=2, 
+            thresholding=False
+        )
+    else:
+        # Fallback to DDIM
+        scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
     
     return vae, tokenizer, text_encoder, unet, scheduler
 
