@@ -3,7 +3,7 @@ import torch
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, StableDiffusionPipeline
 
-from diffusers import LMSDiscreteScheduler, DDIMScheduler
+from diffusers import LMSDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler
 
 
 # From "https://huggingface.co/blog/stable_diffusion"
