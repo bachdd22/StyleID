@@ -15,7 +15,6 @@ class style_transfer_module():
     def __init__(self,
         unet, vae, text_encoder, tokenizer, scheduler, cfg, style_transfer_params = None,
     ):  
-        # [cite: 129] Dynamic Gamma Default: Start at 0.9 (Structure), End at 0.4 (Texture)
         style_transfer_params_default = {
             'gamma_start': 0.9, 
             'gamma_end': 0.4,
@@ -38,7 +37,6 @@ class style_transfer_module():
         self.attn_features_modify = {} 
         self.cur_t = None
         
-        # Setup hooks
         resnet, attn = get_unet_layers(unet)
         self.injection_layers_ids = self.style_transfer_params['injection_layers']
         
@@ -57,36 +55,22 @@ class style_transfer_module():
         self.attn_features_modify = {}
 
     def get_text_condition(self, text):
-        # ... (Same as original) ...
         if text is None:
             uncond_input = self.tokenizer(
                 [""], padding="max_length", max_length=self.tokenizer.model_max_length, return_tensors="pt"
             )
             uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.text_encoder.device))[0].to(self.text_encoder.device)
             return {'encoder_hidden_states': uncond_embeddings}
-        return None # Simplified for brevity
+        return None 
 
-    # --- UPDATED: Dynamic Gamma Calculation ---
     def get_dynamic_gamma(self, current_timestep):
-        """
-        Calculates gamma based on linear decay from High Noise (start) to Low Noise (end).
-        Formula: gamma(t) = gamma_max - (gamma_max - gamma_min) * (T - t)/T
-        [cite: 128]
-        """
-        # Total training steps (usually 1000 for SD)
+        # Timesteps go from 1000 -> 0. 
+        # We want high gamma (content) at 1000, low gamma (style) at 0.
         max_t = self.scheduler.config.num_train_timesteps 
-        
-        # current_timestep comes in as a tensor or float (e.g., 981, 800, ... 0)
         t = int(current_timestep)
-        
         g_start = self.style_transfer_params['gamma_start']
         g_end = self.style_transfer_params['gamma_end']
-        
-        # Calculate progress ratio (0.0 at start, 1.0 at end)
-        # Note: timesteps go from 1000 -> 0
         ratio = (max_t - t) / max_t
-        
-        # Linear Interpolation
         current_gamma = g_start - (g_start - g_end) * ratio
         return current_gamma
 
@@ -94,25 +78,22 @@ class style_transfer_module():
         pred_images = []
         decode_kwargs = {'vae': self.vae}
         
-        # UniPC/DDIM Loop
+        # --- FIX 1: Reset Scheduler State ---
+        # This resets the step_index and history, preventing the AssertionError
+        self.scheduler.set_timesteps(self.cfg.ddim_steps)
+        
         for t in self.scheduler.timesteps:
             self.cur_t = t.item()
             with torch.no_grad():
-                # Expand latent if using classifier free guidance
                 latent_model_input = torch.cat([input] * 2) if self.cfg.guidance_scale > 1.0 else input
-                
-                # Scale input (Required for UniPC/multistep schedulers)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # Predict noise
                 noise_pred = self.unet(latent_model_input, t, **denoise_kwargs).sample
 
-                # CFG
                 if self.cfg.guidance_scale > 1.0:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
-                # Step
                 step_output = self.scheduler.step(noise_pred, t, input)
                 input = step_output.prev_sample
                 
@@ -120,43 +101,54 @@ class style_transfer_module():
         return [final_image], [input]
 
     def invert_process(self, input, denoise_kwargs):
-        # NOTE: Inversion usually requires DDIM even if generation uses UniPC.
-        # For simplicity, we assume standard DDIM Inversion here as per the original code.
-        # Ideally, use the "Direct Inversion" mentioned in the report, but here we keep the loop structure.
+        # --- FIX 2: Correct DDIM Inversion Math ---
+        # UniPC cannot invert, so we perform manual DDIM inversion
         pred_latents = []
+        # Inversion goes from t=0 to t=1000 (reversed list of timesteps)
+        # Note: self.scheduler.timesteps is [981, ..., 1]. reversed is [1, ..., 981]
         timesteps = reversed(self.scheduler.timesteps)
-        num_inference_steps = len(self.scheduler.timesteps)
+        
         cur_latent = input.clone()
 
         with torch.no_grad():
-            for i in range(0, num_inference_steps):
-                t = timesteps[i]
+            for i, t in enumerate(timesteps):
                 self.cur_t = t.item()
                 
-                # Standard DDIM Inversion Step (simplified)
+                # Predict noise
                 noise_pred = self.unet(cur_latent, t, **denoise_kwargs).sample
                 
-                # Simple geometric inversion (assuming low CFG for inversion)
-                current_t = max(0, t.item() - (1000//num_inference_steps))
+                # Get alphas
+                current_t = t.item()
+                # Find next t (which is actually previous in the reversed list, or just +step)
+                # Since we are inverting, "next" means higher noise level
+                # Look up alpha_cumprod
                 alpha_t = self.scheduler.alphas_cumprod[current_t]
-                beta_t = 1 - alpha_t
                 
-                # Note: This is a placeholder for the exact DDIM inversion math 
-                # dependent on the specific scheduler implementation details.
-                # For exact "Direct Inversion" described in the paper, we would cache latents here.
-                # Standard approximation:
-                cur_latent = (cur_latent + beta_t.sqrt() * noise_pred) / alpha_t.sqrt() 
+                # Handle edge case for last step
+                if i < len(self.scheduler.timesteps) - 1:
+                    next_t = self.scheduler.timesteps[len(self.scheduler.timesteps) - i - 2].item()
+                    alpha_next = self.scheduler.alphas_cumprod[next_t]
+                else:
+                    alpha_next = self.scheduler.alphas_cumprod[0] # Should point to T=1000 approx
+
+                # DDIM Inversion Update: z_{t+1}
+                # 1. Predict x0
+                pred_x0 = (cur_latent - (1 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
+                
+                # 2. Direction to z_{t+1}
+                dir_xt = (1 - alpha_next).sqrt() * noise_pred
+                
+                # 3. Combine
+                cur_latent = alpha_next.sqrt() * pred_x0 + dir_xt
+                
                 pred_latents.append(cur_latent)
-                
+        
         return None, pred_latents
 
-    # --- Hooks ---
     def __get_query_key_value(self, name):
         def hook(model, input, output):
             if self.trigger_get_qkv:
-                # Capture features
                 _, query, key, value, _ = attention_op(model, input[0])
-                # We interpret self.cur_t as the key for the dictionary
                 self.attn_features[name][int(self.cur_t)] = (query.detach().cpu(), key.detach().cpu(), value.detach().cpu())
         return hook
 
@@ -172,14 +164,8 @@ class style_transfer_module():
                     k_s = k_s.to(q_cs.device)
                     v_s = v_s.to(q_cs.device)
 
-                    # --- DYNAMIC GAMMA APPLICATION ---
-                    # Calculate gamma for this specific timestep [cite: 125, 126]
                     gamma_t = self.get_dynamic_gamma(self.cur_t)
-                    
-                    # Apply: Q_cs = gamma_t * Q_content + (1-gamma_t) * Q_stylized
                     q_hat_cs = q_c * gamma_t + q_cs * (1 - gamma_t)
-                    
-                    # Inject Style Keys and Values
                     k_cs, v_cs = k_s, v_s
                     
                     _, _, _, _, modified_output = attention_op(model, input[0], key=k_cs, value=v_cs, query=q_hat_cs, temperature=self.style_transfer_params['tau'])
@@ -199,6 +185,8 @@ def main():
     style_dir = "data/sty"    
     output_dir = cfg.save_dir
     os.makedirs(output_dir, exist_ok=True)
+
+    cfg.guidance_scale = 0.
     
     content_files = sorted(glob.glob(os.path.join(content_dir, "*.*")))[:20] # Limit to 20 as requested
     style_files = sorted(glob.glob(os.path.join(style_dir, "*.*")))[:40]   # Limit to 40 as requested
@@ -210,8 +198,7 @@ def main():
     print("Loading Stable Diffusion with UniPC...")
     vae, tokenizer, text_encoder, unet, scheduler = load_stable_diffusion(
         sd_version=cfg.sd_version, 
-        precision_t=dtype, 
-        scheduler_type="unipc"
+        precision_t=dtype
     )
     scheduler.set_timesteps(cfg.ddim_steps)
     
