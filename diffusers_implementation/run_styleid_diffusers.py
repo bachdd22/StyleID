@@ -1,27 +1,29 @@
 import torch
 import numpy as np, copy, os, sys
+import matplotlib.pyplot as plt
 import glob
-from tqdm import tqdm
-import cv2
+from utils import * # image save utils
+from stable_diffusion import load_stable_diffusion, encode_latent, decode_latent, get_text_embedding, get_unet_layers, attention_op  # load SD
+import copy
 import argparse
+import cv2
+from tqdm import tqdm
 
-# Ensure you import the updated load function
-from stable_diffusion import load_stable_diffusion, encode_latent, decode_latent, get_unet_layers, attention_op 
-from utils import save_image, normalize, denormalize 
-# (Assuming 'utils' and 'config' exist as per your original upload)
-from config import get_args 
+from config import get_args
 
 class style_transfer_module():
+           
     def __init__(self,
         unet, vae, text_encoder, tokenizer, scheduler, cfg, style_transfer_params = None,
     ):  
         style_transfer_params_default = {
-            'gamma_start': 0.9, 
-            'gamma_end': 0.4,
+            'gamma': 0.75,
             'tau': 1.5,
-            'injection_layers': [7, 8, 9, 10, 11]
+            'injection_layers': [7, 8, 9, 10, 11],
+            'gamma_schedule': False,
+            'gamma_start': 0.9,
+            'gamma_end': 0.6
         }
-        
         if style_transfer_params is not None:
             style_transfer_params_default.update(style_transfer_params)
         self.style_transfer_params = style_transfer_params_default
@@ -35,14 +37,25 @@ class style_transfer_module():
 
         self.attn_features = {} 
         self.attn_features_modify = {} 
+
         self.cur_t = None
         
         resnet, attn = get_unet_layers(unet)
         self.injection_layers_ids = self.style_transfer_params['injection_layers']
         
+        # Pre-calculate min/max for layer-dependent tau scaling
+        if len(self.injection_layers_ids) > 0:
+            self.min_layer = min(self.injection_layers_ids)
+            self.max_layer = max(self.injection_layers_ids)
+        else:
+            self.min_layer = 0
+            self.max_layer = 1
+        
+        # Initialize dictionary keys for injection layers
         for i in self.injection_layers_ids:
             layer_name = "layer{}_attn".format(i)
             self.attn_features[layer_name] = {}
+            # Register hooks
             attn[i].transformer_blocks[0].attn1.register_forward_hook(self.__get_query_key_value(layer_name))
             attn[i].transformer_blocks[0].attn1.register_forward_hook(self.__modify_self_attn_qkv(layer_name))
         
@@ -50,10 +63,11 @@ class style_transfer_module():
         self.trigger_modify_qkv = False 
         
     def clean_features(self):
+        """Clears the attention features to prevent memory leaks and mixing data between runs."""
         for layer_name in self.attn_features:
             self.attn_features[layer_name] = {}
         self.attn_features_modify = {}
-
+        
     def get_text_condition(self, text):
         if text is None:
             uncond_input = self.tokenizer(
@@ -61,90 +75,98 @@ class style_transfer_module():
             )
             uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.text_encoder.device))[0].to(self.text_encoder.device)
             return {'encoder_hidden_states': uncond_embeddings}
-        return None 
-
-    def get_dynamic_gamma(self, current_timestep):
-        # Timesteps go from 1000 -> 0. 
-        # We want high gamma (content) at 1000, low gamma (style) at 0.
-        max_t = self.scheduler.config.num_train_timesteps 
-        t = int(current_timestep)
-        g_start = self.style_transfer_params['gamma_start']
-        g_end = self.style_transfer_params['gamma_end']
-        ratio = (max_t - t) / max_t
-        current_gamma = g_start - (g_start - g_end) * ratio
-        return current_gamma
-
+        
+        text_embeddings, uncond_embeddings = get_text_embedding(text, self.text_encoder, self.tokenizer)
+        text_cond = [text_embeddings, uncond_embeddings]
+        denoise_kwargs = {
+            'encoder_hidden_states': torch.cat(text_cond)
+        }
+        return denoise_kwargs
+    
     def reverse_process(self, input, denoise_kwargs):
         pred_images = []
+        pred_latents = []
         decode_kwargs = {'vae': self.vae}
         
-        # --- FIX 1: Reset Scheduler State ---
-        # This resets the step_index and history, preventing the AssertionError
-        self.scheduler.set_timesteps(self.cfg.ddim_steps)
+        # Retrieve scheduling parameters
+        use_schedule = self.style_transfer_params.get('gamma_schedule', False)
+        g_start = self.style_transfer_params.get('gamma_start', 0.9)
+        g_end = self.style_transfer_params.get('gamma_end', 0.6)
+        total_steps = len(self.scheduler.timesteps)
         
-        for t in self.scheduler.timesteps:
+        for i, t in enumerate(self.scheduler.timesteps):
             self.cur_t = t.item()
+            
+            # --- Dynamic Gamma Scheduling ---
+            if use_schedule:
+                progress = i / max(1, total_steps - 1)
+                new_gamma = g_start + (g_end - g_start) * progress
+                self.style_transfer_params['gamma'] = new_gamma
+            # --------------------------------
+            
             with torch.no_grad():
-                latent_model_input = torch.cat([input] * 2) if self.cfg.guidance_scale > 1.0 else input
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                noise_pred = self.unet(latent_model_input, t, **denoise_kwargs).sample
-
-                if self.cfg.guidance_scale > 1.0:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                if 'encoder_hidden_states' in denoise_kwargs.keys():
+                    bs = denoise_kwargs['encoder_hidden_states'].shape[0]
+                    input_model = torch.cat([input] * bs)
+                else:
+                    input_model = input
                 
-                step_output = self.scheduler.step(noise_pred, t, input)
+                # Forward pass
+                noisy_residual = self.unet(input_model, t.to(input.device), **denoise_kwargs).sample
+                    
+                if noisy_residual.shape[0] == 2:
+                    noise_pred_text, noise_pred_uncond = noisy_residual.chunk(2)
+                    noisy_residual = noise_pred_uncond + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # Scheduler step
+                step_output = self.scheduler.step(noisy_residual, t, input)
                 input = step_output.prev_sample
                 
         final_image = decode_latent(input, **decode_kwargs)
         return [final_image], [input]
 
     def invert_process(self, input, denoise_kwargs):
-        # --- FIX 2: Correct DDIM Inversion Math ---
-        # UniPC cannot invert, so we perform manual DDIM inversion
         pred_latents = []
-        # Inversion goes from t=0 to t=1000 (reversed list of timesteps)
-        # Note: self.scheduler.timesteps is [981, ..., 1]. reversed is [1, ..., 981]
         timesteps = reversed(self.scheduler.timesteps)
-        
+        num_inference_steps = len(self.scheduler.timesteps)
         cur_latent = input.clone()
 
         with torch.no_grad():
-            for i, t in enumerate(timesteps):
+            for i in range(0, num_inference_steps):
+                t = timesteps[i]
                 self.cur_t = t.item()
                 
-                # Predict noise
-                noise_pred = self.unet(cur_latent, t, **denoise_kwargs).sample
-                
-                # Get alphas
-                current_t = t.item()
-                # Find next t (which is actually previous in the reversed list, or just +step)
-                # Since we are inverting, "next" means higher noise level
-                # Look up alpha_cumprod
-                alpha_t = self.scheduler.alphas_cumprod[current_t]
-                
-                # Handle edge case for last step
-                if i < len(self.scheduler.timesteps) - 1:
-                    next_t = self.scheduler.timesteps[len(self.scheduler.timesteps) - i - 2].item()
-                    alpha_next = self.scheduler.alphas_cumprod[next_t]
+                if 'encoder_hidden_states' in denoise_kwargs.keys():
+                    bs = denoise_kwargs['encoder_hidden_states'].shape[0]
+                    cur_latent_input = torch.cat([cur_latent] * bs)
                 else:
-                    alpha_next = self.scheduler.alphas_cumprod[0] # Should point to T=1000 approx
+                    cur_latent_input = cur_latent
 
-                # DDIM Inversion Update: z_{t+1}
-                # 1. Predict x0
-                pred_x0 = (cur_latent - (1 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt()
-                
-                # 2. Direction to z_{t+1}
-                dir_xt = (1 - alpha_next).sqrt() * noise_pred
-                
-                # 3. Combine
-                cur_latent = alpha_next.sqrt() * pred_x0 + dir_xt
+                noise_pred = self.unet(cur_latent_input, t.to(cur_latent.device), **denoise_kwargs).sample
+
+                if noise_pred.shape[0] == 2:
+                    noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                current_t = max(0, t.item() - (1000//num_inference_steps))
+                next_t = t
+                alpha_t = self.scheduler.alphas_cumprod[current_t]
+                alpha_t_next = self.scheduler.alphas_cumprod[next_t]
+
+                if self.cfg.sd_version == "2.1":
+                    beta_t = 1 - alpha_t
+                    pred_original_sample = alpha_t.sqrt() * cur_latent - beta_t.sqrt() * noise_pred
+                    pred_epsilon = alpha_t.sqrt() * noise_pred + beta_t.sqrt() * cur_latent
+                    pred_sample_direction = (1 - alpha_t_next).sqrt() * pred_epsilon
+                    cur_latent = alpha_t_next.sqrt() * pred_original_sample + pred_sample_direction
+                else:
+                    cur_latent = (cur_latent - (1-alpha_t).sqrt()*noise_pred)*(alpha_t_next.sqrt()/alpha_t.sqrt()) + (1-alpha_t_next).sqrt()*noise_pred
                 
                 pred_latents.append(cur_latent)
         
-        return None, pred_latents
+        return None, pred_latents 
 
+    # ============================ hook operations ===============================
     def __get_query_key_value(self, name):
         def hook(model, input, output):
             if self.trigger_get_qkv:
@@ -164,124 +186,164 @@ class style_transfer_module():
                     k_s = k_s.to(q_cs.device)
                     v_s = v_s.to(q_cs.device)
 
-                    gamma_t = self.get_dynamic_gamma(self.cur_t)
-                    q_hat_cs = q_c * gamma_t + q_cs * (1 - gamma_t)
+                    q_hat_cs = q_c * self.style_transfer_params['gamma'] + q_cs * (1 - self.style_transfer_params['gamma'])
                     k_cs, v_cs = k_s, v_s
                     
-                    _, _, _, _, modified_output = attention_op(model, input[0], key=k_cs, value=v_cs, query=q_hat_cs, temperature=self.style_transfer_params['tau'])
+                    # --- NEW: Layer-dependent Tau Scaling ---
+                    # Extract layer_id from name (e.g., "layer7_attn" -> 7)
+                    layer_id = int(name[5:-5])
+                    
+                    # Calculate layer-specific scalar based on relative position in the injection block
+                    # Formula: tau * (1 + 0.5 * (current - min) / (max - min))
+                    denominator = max(1, self.max_layer - self.min_layer)
+                    scale_factor = (layer_id - self.min_layer) / denominator
+                    effective_tau = self.style_transfer_params['tau'] * (1 + 0.5 * scale_factor)
+                    # ----------------------------------------
+                    
+                    _, _, _, _, modified_output = attention_op(model, input[0], key=k_cs, value=v_cs, query=q_hat_cs, temperature=effective_tau)
                     return modified_output
         return hook
 
 def main():
+    # --- Configuration ---
     cfg = get_args()
     
-    # --- UPDATE: Override Steps for UniPC ---
-    # The report suggests 15-20 steps for UniPC are sufficient[cite: 112].
-    # This replaces the default 50 steps of DDIM.
-    cfg.ddim_steps = 20 
-    print(f"Using UniPC Scheduler with {cfg.ddim_steps} inference steps.")
-
     content_dir = "data/cnt" 
-    style_dir = "data/sty"    
+    style_dir = "data/sty"
     output_dir = cfg.save_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    cfg.guidance_scale = 0.
     
-    content_files = sorted(glob.glob(os.path.join(content_dir, "*.*")))[:20] # Limit to 20 as requested
-    style_files = sorted(glob.glob(os.path.join(style_dir, "*.*")))[:40]   # Limit to 40 as requested
+    os.makedirs(output_dir, exist_ok=True)
+    
+    content_files = sorted(glob.glob(os.path.join(content_dir, "*.png")) + glob.glob(os.path.join(content_dir, "*.jpg")))
+    style_files = sorted(glob.glob(os.path.join(style_dir, "*.png")) + glob.glob(os.path.join(style_dir, "*.jpg")))
+    
+    print(f"Found {len(content_files)} content images and {len(style_files)} style images.")
     
     device = "cuda"
     dtype = torch.float16 
+    cfg.guidance_scale = 0.0 
     
-    # Load SD with UniPC
-    print("Loading Stable Diffusion with UniPC...")
-    vae, tokenizer, text_encoder, unet, scheduler = load_stable_diffusion(
-        sd_version=cfg.sd_version, 
-        precision_t=dtype
-    )
+    print("Loading Stable Diffusion...")
+    vae, tokenizer, text_encoder, unet, scheduler = load_stable_diffusion(sd_version=cfg.sd_version, precision_t=dtype)
     scheduler.set_timesteps(cfg.ddim_steps)
     
-    # Define Dynamic Params
-    style_params = {
-        'gamma_start': 0.9, # High structure preservation early
-        'gamma_end': 0.4,   # High style transfer late
-        'tau': 1.5,
+    # Init module with DYNAMIC GAMMA and TAU parameters
+    style_transfer_params = {
+        'gamma': cfg.gamma,          
+        'gamma_schedule': True,      
+        'gamma_start': 0.9,          
+        'gamma_end': 0.6,            
+        'tau': cfg.T, 
         'injection_layers': cfg.layers
     }
-    
-    unet_wrapper = style_transfer_module(unet, vae, text_encoder, tokenizer, scheduler, cfg, style_transfer_params=style_params)
+    unet_wrapper = style_transfer_module(unet, vae, text_encoder, tokenizer, scheduler, cfg, style_transfer_params=style_transfer_params)
 
-    # --- Phase 1 & 2 (Looping Logic) ---
-    # (The original double-loop structure for batch processing remains valid)
-    print("Starting Batch Processing...")
+    # --- PHASE 1: Pre-calculate Content Features ---
+    print("Pre-calculating Content Inversions...")
+    content_cache = {} 
     
-    # Cache content features
-    content_cache = {}
     unet_wrapper.trigger_get_qkv = True
     unet_wrapper.trigger_modify_qkv = False
     
-    for c_fn in tqdm(content_files, desc="Pre-computing Content"):
+    for c_fn in tqdm(content_files, desc="Inverting Contents"):
         c_name = os.path.basename(c_fn).split('.')[0]
-        img = cv2.imread(c_fn)[:, :, ::-1]
+        content_image = cv2.imread(c_fn)[:, :, ::-1]
         
         unet_wrapper.clean_features()
         denoise_kwargs = unet_wrapper.get_text_condition(None)
-        latent = encode_latent(normalize(img).to(device=vae.device, dtype=dtype), vae)
+        content_latent = encode_latent(normalize(content_image).to(device=vae.device, dtype=dtype), vae)
         
-        # Note: Inversion is still best done with DDIM or explicit Direct Inversion. 
-        # Ideally, we temporarily swap scheduler to DDIM for inversion here, 
-        # but for this snippet we assume the scheduler handles the inverse or we used a cached inversion.
-        _, latents = unet_wrapper.invert_process(latent, denoise_kwargs)
+        _, latents = unet_wrapper.invert_process(content_latent, denoise_kwargs=denoise_kwargs)
+        final_latent = latents[-1].detach().cpu()
+        features_snapshot = copy.deepcopy(unet_wrapper.attn_features)
         
-        # Save cache
-        content_cache[c_name] = (latents[-1].cpu(), copy.deepcopy(unet_wrapper.attn_features))
+        content_cache[c_name] = (final_latent, features_snapshot)
 
-    # Style Loop
-    for s_fn in tqdm(style_files, desc="Generating Styles"):
+    # --- PHASE 2: Iterate Styles and Generate ---
+    print("Processing Styles and Generating Pairs...")
+    
+    for s_fn in tqdm(style_files, desc="Style Loop"):
         s_name = os.path.basename(s_fn).split('.')[0]
-        img = cv2.imread(s_fn)[:, :, ::-1]
+        style_image = cv2.imread(s_fn)[:, :, ::-1]
         
+        # 2a. Invert Style
         unet_wrapper.clean_features()
         unet_wrapper.trigger_get_qkv = True
         unet_wrapper.trigger_modify_qkv = False
         
         denoise_kwargs = unet_wrapper.get_text_condition(None)
-        latent = encode_latent(normalize(img).to(device=vae.device, dtype=dtype), vae)
+        style_latent = encode_latent(normalize(style_image).to(device=vae.device, dtype=dtype), vae)
         
-        _, latents = unet_wrapper.invert_process(latent, denoise_kwargs)
+        _, latents = unet_wrapper.invert_process(style_latent, denoise_kwargs=denoise_kwargs)
+        style_latent_inverted = latents[-1] 
+        
         style_features = copy.deepcopy(unet_wrapper.attn_features)
-        style_latent_inverted = latents[-1]
         
-        # Apply to all contents
+        # 2b. Inner Loop: Apply this style to ALL contents
         for c_name, (c_latent_cpu, c_features_cpu) in content_cache.items():
+            
             unet_wrapper.clean_features()
             unet_wrapper.trigger_get_qkv = False
-            unet_wrapper.trigger_modify_qkv = True # Enable injection
+            unet_wrapper.trigger_modify_qkv = not cfg.without_attn_injection
             
-            # Map features for injection
-            for layer in style_features:
-                unet_wrapper.attn_features_modify[layer] = {}
+            # Construct Modify Features
+            for layer_name in style_features.keys():
+                unet_wrapper.attn_features_modify[layer_name] = {}
                 for t in scheduler.timesteps:
                     t_item = t.item()
-                    if t_item in c_features_cpu[layer] and t_item in style_features[layer]:
-                         q_c = c_features_cpu[layer][t_item][0]
-                         k_s = style_features[layer][t_item][1]
-                         v_s = style_features[layer][t_item][2]
-                         unet_wrapper.attn_features_modify[layer][t_item] = (q_c, k_s, v_s)
+                    
+                    q_c = c_features_cpu[layer_name][t_item][0] 
+                    k_s = style_features[layer_name][t_item][1]
+                    v_s = style_features[layer_name][t_item][2]
+                    
+                    unet_wrapper.attn_features_modify[layer_name][t_item] = (q_c, k_s, v_s)
             
-            # AdaIN Init (simplified)
             c_latent_gpu = c_latent_cpu.to(device)
-            latent_cs = (c_latent_gpu - c_latent_gpu.mean(dim=(2, 3), keepdim=True)) / \
-                        (c_latent_gpu.std(dim=(2, 3), keepdim=True) + 1e-4) * \
-                        style_latent_inverted.std(dim=(2, 3), keepdim=True) + \
-                        style_latent_inverted.mean(dim=(2, 3), keepdim=True)
+            
+            # --- NEW: Tunable Initial Latent AdaIN ---
+            if cfg.without_init_adain:
+                latent_cs = c_latent_gpu
+            else:
+                # Calculate Full AdaIN
+                adain_mod = (c_latent_gpu - c_latent_gpu.mean(dim=(2, 3), keepdim=True)) / \
+                            (c_latent_gpu.std(dim=(2, 3), keepdim=True) + 1e-4) * \
+                            style_latent_inverted.std(dim=(2, 3), keepdim=True) + \
+                            style_latent_inverted.mean(dim=(2, 3), keepdim=True)
+                
+                # Blend with Original using adain_strength
+                # Formula: c + strength * (adain - c)
+                latent_cs = c_latent_gpu + cfg.adain_strength * (adain_mod - c_latent_gpu)
+            # ------------------------------------------
 
-            # Generate with UniPC + Dynamic Gamma
-            images, _ = unet_wrapper.reverse_process(latent_cs, denoise_kwargs)
+            # Generate
+            images, _ = unet_wrapper.reverse_process(latent_cs, denoise_kwargs=denoise_kwargs)
             
             save_name = f"{s_name}_to_{c_name}.jpg"
             image_final = denormalize(images[-1])[0]
+            
+            # --- NEW: Post-generation RGB AdaIN ---
+            # Pixel-wise color correction using style image statistics
+            if not cfg.without_init_adain: # Only apply if AdaIN is generally enabled
+                image_final_float = image_final.astype(float)
+                style_image_float = style_image.astype(float)
+                
+                for c in range(3):
+                    # Compute stats
+                    mean_c = np.mean(image_final_float[:,:,c])
+                    std_c = np.std(image_final_float[:,:,c])
+                    mean_s = np.mean(style_image_float[:,:,c])
+                    std_s = np.std(style_image_float[:,:,c])
+                    
+                    # Apply AdaIN
+                    image_final_float[:,:,c] = (
+                        (image_final_float[:,:,c] / 255.0 - mean_c / 255.0) / (std_c / 255.0 + 1e-5) 
+                        * (std_s / 255.0) + (mean_s / 255.0)
+                    ) * 255.0
+                
+                # Clip and cast back
+                image_final = np.clip(image_final_float, 0, 255).astype(np.uint8)
+            # ---------------------------------------
+
             save_image(image_final, os.path.join(output_dir, save_name))
 
 if __name__ == "__main__":
