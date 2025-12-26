@@ -34,8 +34,9 @@ def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="c
     
     del pipe
     
-    # Use DDIM scheduler
-    scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
+    # [Cite: 12, 108] Use UniPC Scheduler with solver_order=2 for speed/quality balance
+    scheduler = UniPCMultistepScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
+    scheduler.config.solver_order = 2
     
     return vae, tokenizer, text_encoder, unet, scheduler
 
