@@ -251,8 +251,7 @@ def main():
     print("Loading Stable Diffusion...")
     vae, tokenizer, text_encoder, unet, scheduler = load_stable_diffusion(
         sd_version=cfg.sd_version, 
-        precision_t=dtype, 
-        scheduler_type=scheduler_name
+        precision_t=dtype
     )
     scheduler.set_timesteps(inference_steps)
     
