@@ -7,7 +7,7 @@ from diffusers import LMSDiscreteScheduler, DDIMScheduler, UniPCMultistepSchedul
 
 
 # From "https://huggingface.co/blog/stable_diffusion"
-def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="cuda", scheduler_type="unipc"):
+def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="cuda"):
     if sd_version == '2.1':
         model_key = "Manojb/stable-diffusion-2-1-base"
     elif sd_version == '2.1-base':
@@ -33,20 +33,9 @@ def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="c
     # unet.enable_xformers_memory_efficient_attention()
     
     del pipe
-    
-    if scheduler_type == "unipc":
-        # Configure UniPC: solver_order=2 is optimal for guided sampling (CFG) [cite: 109]
-        # thresholding=False is recommended for latent models [cite: 111]
-        scheduler = UniPCMultistepScheduler.from_pretrained(
-            model_key, 
-            subfolder="scheduler", 
-            torch_dtype=precision_t,
-            solver_order=2, 
-            thresholding=False
-        )
-    else:
-        # Fallback to DDIM
-        scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
+
+    # Use DDIM scheduler
+    scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
     
     return vae, tokenizer, text_encoder, unet, scheduler
 
