@@ -7,7 +7,7 @@ from diffusers import LMSDiscreteScheduler, DDIMScheduler, UniPCMultistepSchedul
 
 
 # From "https://huggingface.co/blog/stable_diffusion"
-def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="cuda"):
+def load_stable_diffusion(sd_version='2.1', precision_t=torch.float32, device="cuda", scheduler_type="unipc"):
     if sd_version == '2.1':
         model_key = "Manojb/stable-diffusion-2-1-base"
     elif sd_version == '2.1-base':
