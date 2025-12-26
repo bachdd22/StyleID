@@ -17,9 +17,7 @@ class style_transfer_module():
         unet, vae, text_encoder, tokenizer, scheduler, cfg, style_transfer_params = None,
     ):  
         style_transfer_params_default = {
-            'gamma': 0.75,       # Fallback static value
-            'gamma_max': 0.9,    # [CHANGE] Start high to preserve layout (early steps) [cite: 835]
-            'gamma_min': 0.4,    # [CHANGE] End low to allow texture transfer (late steps) [cite: 835]
+            'gamma': 0.75,
             'tau': 1.5,
             'injection_layers': [7, 8, 9, 10, 11]
         }
@@ -27,14 +25,16 @@ class style_transfer_module():
             style_transfer_params_default.update(style_transfer_params)
         self.style_transfer_params = style_transfer_params_default
         
-        self.unet = unet
+        self.unet = unet 
         self.vae = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.scheduler = scheduler
         self.cfg = cfg
+
         self.attn_features = {} 
         self.attn_features_modify = {} 
+
         self.cur_t = None
         
         resnet, attn = get_unet_layers(unet)
@@ -51,26 +51,6 @@ class style_transfer_module():
         self.trigger_get_qkv = False 
         self.trigger_modify_qkv = False 
         
-        
-    # [CHANGE] Helper to calculate Dynamic Gamma
-    # Formula: gamma(t) = gamma_max - (gamma_max - gamma_min) * (T-t)/T [cite: 834]
-    def get_dynamic_gamma(self, t):
-        # t is the current timestep value (e.g., 981, 500, 1). 
-        # Diffusers schedulers usually go from High (Start) -> Low (End).
-        # We normalize t to [0,1].
-        
-        max_t = self.scheduler.config.num_train_timesteps # usually 1000
-        progress = t / max_t 
-        
-        g_max = self.style_transfer_params['gamma_max']
-        g_min = self.style_transfer_params['gamma_min']
-        
-        # Linear Interpolation: 
-        # When t is high (start), we want Gamma Max (structure preservation).
-        # When t is low (end), we want Gamma Min (style texture).
-        current_gamma = g_min + (g_max - g_min) * progress
-        return current_gamma
-    
     def clean_features(self):
         """Clears the attention features to prevent memory leaks and mixing data between runs."""
         for layer_name in self.attn_features:
@@ -182,37 +162,23 @@ class style_transfer_module():
 
     def __modify_self_attn_qkv(self, name):
         def hook(model, input, output):
-        
             if self.trigger_modify_qkv:
-                
-                # [CHANGE] Calculate gamma dynamically for the current timestep
-                if self.cur_t is not None:
-                    gamma_val = self.get_dynamic_gamma(self.cur_t)
-                else:
-                    gamma_val = self.style_transfer_params['gamma']
-
                 _, q_cs, k_cs, v_cs, _ = attention_op(model, input[0])
                 
-                # Handling timestamp mismatch between Inversion (Dense) and UniPC (Sparse)
-                # UniPC skips steps, so we find the nearest cached feature
-                target_t = int(self.cur_t)
-                if target_t in self.attn_features_modify[name]:
-                     q_c, k_s, v_s = self.attn_features_modify[name][target_t]
-                else:
-                    # Find nearest neighbor time step if exact match missing
-                    cached_timesteps = np.array(list(self.attn_features_modify[name].keys()))
-                    nearest_t = cached_timesteps[np.abs(cached_timesteps - target_t).argmin()]
-                    q_c, k_s, v_s = self.attn_features_modify[name][nearest_t]
-                
-                # [CHANGE] Apply dynamic gamma injection
-                # q_cs is the stylized query, q_c is the content query
-                q_hat_cs = q_c * gamma_val + q_cs * (1 - gamma_val)
-                k_cs, v_cs = k_s, v_s
-                
-                _, _, _, _, modified_output = attention_op(model, input[0], key=k_cs, value=v_cs, query=q_hat_cs, temperature=self.style_transfer_params['tau'])
-                
-                return modified_output
-        
+                # Retrieve from modify dict (Should be on GPU)
+                if int(self.cur_t) in self.attn_features_modify[name]:
+                    q_c, k_s, v_s = self.attn_features_modify[name][int(self.cur_t)]
+                    
+                    # Ensure tensors are on correct device
+                    q_c = q_c.to(q_cs.device)
+                    k_s = k_s.to(q_cs.device)
+                    v_s = v_s.to(q_cs.device)
+
+                    q_hat_cs = q_c * self.style_transfer_params['gamma'] + q_cs * (1 - self.style_transfer_params['gamma'])
+                    k_cs, v_cs = k_s, v_s
+                    
+                    _, _, _, _, modified_output = attention_op(model, input[0], key=k_cs, value=v_cs, query=q_hat_cs, temperature=self.style_transfer_params['tau'])
+                    return modified_output
         return hook
 
 def main():
@@ -234,14 +200,6 @@ def main():
     
     print(f"Found {len(content_files)} content images and {len(style_files)} style images.")
     
-    use_unipc = True 
-    if use_unipc:
-        inference_steps = 20 
-        scheduler_name = "unipc"
-    else:
-        inference_steps = cfg.ddim_steps
-        scheduler_name = "ddim"
-    
     # Options
     device = "cuda"
     dtype = torch.float16 # Use float16 for speed/memory
@@ -249,19 +207,11 @@ def main():
     
     # --- Load Model Once ---
     print("Loading Stable Diffusion...")
-    vae, tokenizer, text_encoder, unet, scheduler = load_stable_diffusion(
-        sd_version=cfg.sd_version, 
-        precision_t=dtype
-    )
-    scheduler.set_timesteps(inference_steps)
+    vae, tokenizer, text_encoder, unet, scheduler = load_stable_diffusion(sd_version=cfg.sd_version, precision_t=dtype)
+    scheduler.set_timesteps(cfg.ddim_steps)
     
     # Init module
-    style_transfer_params = {
-        'gamma_max': 0.9, # Start strong on structure [cite: 835]
-        'gamma_min': 0.4, # End strong on style [cite: 835]
-        'tau': cfg.T,
-        'injection_layers': cfg.layers,
-    }    
+    style_transfer_params = {'gamma': cfg.gamma, 'tau': cfg.T, 'injection_layers': cfg.layers}
     unet_wrapper = style_transfer_module(unet, vae, text_encoder, tokenizer, scheduler, cfg, style_transfer_params=style_transfer_params)
 
     # --- PHASE 1: Pre-calculate Content Features (The "Query") ---
